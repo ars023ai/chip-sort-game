@@ -22,7 +22,7 @@
 <div class="topline"><h1 class="title">CHIP<span>STACK SORT</span></h1><div class="score" id="score-card"><div class="score-label"><span aria-hidden="true">✦</span> SCORE</div><div class="score-value" id="score">0</div></div></div>
 <div class="stats"><span><span class="tiny" aria-hidden="true">♜</span> BEST <strong id="best">0</strong></span><span><strong id="open-count">30</strong> / 30 open slots</span></div>
 </header>
-<div class="board-caption"><span><b>10 of a kind</b> = 100 points</span><span class="legend" aria-label="Six chip brands"><i style="background:#3779ed"></i><i style="background:#ef4d5c"></i><i style="background:#ff951c"></i><i style="background:#31c1c0"></i><i style="background:#8a59d1"></i><i style="background:#c9e747"></i></span></div>
+<div class="board-caption"><span><b>10+ ignite the stack</b> · 10 pts / chip</span><span class="legend" aria-label="Six chip brands"><i style="background:#3779ed"></i><i style="background:#ef4d5c"></i><i style="background:#ff951c"></i><i style="background:#31c1c0"></i><i style="background:#8a59d1"></i><i style="background:#c9e747"></i></span></div>
 <div class="tray-heading"><strong>YOUR NEXT MOVE</strong><span id="tray-status">3 stacks to play</span></div>
 <footer class="footer"><div class="controls"><button class="icon-button" id="sound-btn" aria-label="Turn sound on" aria-pressed="false" title="Sound on/off"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z"/><path id="sound-waves" d="m16 9 6 6m0-6-6 6"/></svg></button><button class="icon-button" id="help-btn" aria-label="How to play" title="How to play"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 .4c0 1.8-2.5 1.8-2.5 3.6M12 16h.01"/></svg></button></div><div class="footer-note" id="hint">A little order. A lot of satisfaction.<br><strong>Pick a stack. Find its people.</strong></div><button class="icon-button" id="restart-btn" aria-label="Restart game" title="Restart game"><svg viewBox="0 0 24 24"><path d="M4 10a8 8 0 1 1 1 7M4 4v6h6"/></svg></button></footer>
 <div id="overlay" class="overlay" hidden><div id="modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"></div></div>
@@ -48,7 +48,9 @@ class ChipRules {
   if(y>0)n.push(index-5);if(x>0)n.push(index-1);if(x<4)n.push(index+1);if(y<5)n.push(index+5);return n;
  }
  static run(stack) {if(!stack.length)return 0;let i=stack.length-1;while(i>=0&&stack[i]===stack[stack.length-1])i--;return stack.length-1-i;}
- static full(stack) {return stack.length===10&&stack.every(c=>c===stack[0]);}
+ // Ten contiguous matching top chips ignite the WHOLE stack, including layers.
+ // Total height alone is not a match. There is no capacity limit.
+ static full(stack) {return this.run(stack)>=10;}
  static empty(board) {return board.reduce((n,s)=>n+Number(s.length===0),0);}
  static over(board) {return this.empty(board)===0;}
  static makeTray(random=Math.random) {
@@ -70,49 +72,133 @@ class ChipRules {
   while(queue.length){
    const target=queue.shift();pending.delete(target);
    if(!board[target].length)continue;
-   if(this.full(board[target])){const brand=board[target][0];board[target]=[];yield{type:'clear',index:target,brand};continue;}
+   // Gather EVERY matching neighbor before checking ignition, so 8+6+7
+   // becomes one 21-chip clear, not a 10-chip clear with stranded leftovers.
    for(const source of this.neighbors(target)){
     const dst=board[target],src=board[source];
-    if(!dst.length||dst.length>=10||!src.length||src[src.length-1]!==dst[dst.length-1])continue;
-    const brand=dst[dst.length-1],n=Math.min(this.run(src),10-dst.length);
-    const beforeSource=src.slice(),beforeTarget=dst.slice();
-    const chips=src.splice(src.length-n,n);dst.push(...chips);
+    if(!src.length||src[src.length-1]!==dst[dst.length-1])continue;
+    const n=this.run(src),beforeSource=src.slice(),beforeTarget=dst.slice();
+    const chips=src.splice(src.length-n,n);
+    for(const chip of chips)dst.push(chip);
     yield{type:'merge',from:source,to:target,chips,beforeSource,beforeTarget};
-    // Only newly uncovered brands become new targets. Re-enqueuing unchanged
-    // tops would bounce partial runs back and forth between capacity-bound slots.
-    if(src.length&&src[src.length-1]!==brand)enqueue(source);
-    if(this.full(dst)){board[target]=[];yield{type:'clear',index:target,brand};break;}
+    // Only newly uncovered brands become new targets. This avoids bouncing
+    // an unchanged top run between neighboring stacks indefinitely.
+    if(src.length)enqueue(source);
+   }
+   const stack=board[target];
+   if(this.full(stack)){
+    const chips=stack.slice(),brand=stack[stack.length-1],count=stack.length,matched=this.run(stack);
+    board[target]=[];
+    yield{type:'clear',index:target,brand,chips,count,matched,points:count*10};
    }
   }
  }
 }
 window.ChipRules=ChipRules;
+/* Procedural Foley + musical rewards. All oscillators, noise, filtering and
+   short echo tails are synthesized locally. Optional context injection lets
+   the same engine be verified with OfflineAudioContext. */
+class ChipAudio {
+ constructor(context){
+  this.ctx=context||new(window.AudioContext||window.webkitAudioContext)();
+  const c=this.ctx;this.voices=new Set();this.enabled=true;
+  this.bus=c.createGain();this.bus.gain.value=.8;
+  this.compressor=c.createDynamicsCompressor();
+  this.compressor.threshold.value=-19;this.compressor.knee.value=22;this.compressor.ratio.value=5;
+  this.compressor.attack.value=.003;this.compressor.release.value=.16;
+  this.master=c.createGain();this.master.gain.value=.65;
+  this.bus.connect(this.compressor);this.compressor.connect(this.master);this.master.connect(c.destination);
+  this.echo=c.createDelay(.5);this.echo.delayTime.value=.135;
+  this.echoFilter=c.createBiquadFilter();this.echoFilter.type='lowpass';this.echoFilter.frequency.value=2800;
+  this.feedback=c.createGain();this.feedback.gain.value=.16;
+  this.echo.connect(this.echoFilter);this.echoFilter.connect(this.feedback);this.feedback.connect(this.echo);this.echoFilter.connect(this.bus);
+  this.noise=c.createBuffer(1,Math.ceil(c.sampleRate*.7),c.sampleRate);
+  const samples=this.noise.getChannelData(0);let seed=9371;
+  for(let i=0;i<samples.length;i++){seed=(seed*1664525+1013904223)>>>0;samples[i]=seed/2147483648-1;}
+ }
+ setEnabled(enabled){
+  this.enabled=enabled;const c=this.ctx,at=c.currentTime;
+  this.master.gain.cancelScheduledValues(at);this.master.gain.setTargetAtTime(enabled?.65:0,at,.012);
+  if(enabled&&c.state==='suspended'&&c.resume)c.resume().catch(()=>{});
+ }
+ voice({at=this.ctx.currentTime,duration=.15,type='sine',from=440,to=220,gain=.1,noise=false,filter='lowpass',q=.7,pan=0,echo=0,attack=.004}){
+  if(this.voices.size>=72)return;
+  const c=this.ctx,node=noise?c.createBufferSource():c.createOscillator(),envelope=c.createGain(),nodes=[node,envelope];
+  if(noise){node.buffer=this.noise;node.loop=true;}else node.type=type;
+  const pitch=noise?c.createBiquadFilter():node;
+  if(noise){pitch.type=filter;pitch.Q.value=q;nodes.push(pitch);node.connect(pitch);} 
+  pitch.frequency.setValueAtTime(from,at);pitch.frequency.exponentialRampToValueAtTime(Math.max(25,to),at+duration);
+  if(noise)pitch.connect(envelope);else node.connect(envelope);
+  envelope.gain.setValueAtTime(.0001,at);envelope.gain.exponentialRampToValueAtTime(gain,at+attack);envelope.gain.exponentialRampToValueAtTime(.0001,at+duration);
+  let out=envelope;
+  if(c.createStereoPanner){const p=c.createStereoPanner();p.pan.value=pan;envelope.connect(p);nodes.push(p);out=p;}
+  out.connect(this.bus);
+  if(echo){const send=c.createGain();send.gain.value=echo;out.connect(send);send.connect(this.echo);nodes.push(send);}
+  this.voices.add(node);node.onended=()=>{nodes.forEach(n=>n.disconnect());this.voices.delete(node);};
+  node.start(at);node.stop(at+duration+.015);
+ }
+ play(kind,{chain=0,count=2,pan=0}={}){
+  if(!this.enabled)return;
+  const at=this.ctx.currentTime+.008,pitch=Math.pow(2,Math.min(chain,10)*1.5/12);
+  const v=opts=>this.voice({at,pan,...opts});
+  if(kind==='pick'){v({from:800,to:560,gain:.045,duration:.06});return;}
+  if(kind==='place'||kind==='land'){
+   v({type:'triangle',from:(kind==='land'?300:230)*pitch,to:85,gain:.18,duration:.13});
+   v({noise:true,filter:'highpass',from:4300,to:1800,gain:.075,duration:.045});
+   v({at:at+.012,from:1200*pitch,to:500*pitch,gain:.035,duration:.07});return;
+  }
+  if(kind==='merge'){
+   v({noise:true,filter:'bandpass',q:1.2,from:900*pitch,to:5200*pitch,gain:.11,duration:.18,attack:.02});
+   v({type:'triangle',from:320*pitch,to:890*pitch,gain:.07,duration:.19,echo:.1});
+   const ticks=Math.min(5,count);for(let i=0;i<ticks;i++)v({at:at+i*.026,from:(1250+i*180)*pitch,to:800*pitch,gain:.026,duration:.036});return;
+  }
+  if(kind==='charge'){
+   v({type:'sine',from:210*pitch,to:960*pitch,gain:.055,duration:.16,attack:.065});
+   v({noise:true,filter:'bandpass',from:600,to:2000,gain:.04,duration:.16,attack:.06});return;
+  }
+  if(kind==='clear'){
+   const size=Math.min(2.2,1+Math.log2(Math.max(10,count)/10)*.45);
+   v({from:150,to:38,gain:.26*size,duration:.34});
+   v({noise:true,from:6500,to:230,gain:.20*size,duration:.32});
+   v({type:'triangle',from:330*pitch,to:660*pitch,gain:.075,duration:.15});
+   [1,1.25,1.5,2,2.5].forEach((ratio,i)=>v({at:at+.035+i*.043,from:523.25*ratio*pitch,to:523.25*ratio*pitch,gain:.075,duration:.28+i*.025,echo:.22,pan:pan+(i%2?.16:-.16)}));
+   if(count>=20)v({at:at+.11,from:2093*pitch,to:1568*pitch,gain:.045,duration:.35,echo:.18});return;
+  }
+  if(kind==='error'){
+   v({type:'triangle',from:190,to:105,gain:.12,duration:.12});
+   v({at:at+.08,type:'triangle',from:145,to:85,gain:.075,duration:.13});return;
+  }
+  if(kind==='refresh')[440,554.37,659.25].forEach((f,i)=>v({at:at+i*.04,from:f,to:f,gain:.035,duration:.12}));
+ }
+}
+window.ChipAudio=ChipAudio;
 (() => {
-const W=450,H=800,R=26,STEP=2.75;
+const W=450,H=800,R=26,MAX_DEPTH=8,BOARD_SCALE=.9;
+const depth=n=>Math.min(MAX_DEPTH,Math.max(0,n-1)*2);
 const canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
 const $=id=>document.getElementById(id),reduced=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const boardRect={x:24,y:178,w:402,h:386},pitchX=76,pitchY=59;
 const trayCenters=[89,225,361],trayY=694;
-const game={board:Array.from({length:30},()=>[]),tray:[],score:0,best:0,selected:-1,busy:false,over:false,moves:0,round:1,cursor:-1,keyboard:false,drag:null,hover:-1,flight:null,particles:[],floats:[],pulses:[],invalid:null,combo:0,sound:false,modal:null};
-let audio=null,displayScore=0,last=performance.now(),clock=last,dpr=1,returnFocus=null;
-const icons=[],brandCache=[];
+const game={board:Array.from({length:30},()=>[]),tray:[],score:0,best:0,selected:-1,busy:false,over:false,moves:0,round:1,cursor:-1,keyboard:false,drag:null,hover:-1,flight:null,particles:[],floats:[],pulses:[],invalid:null,combo:0,transfers:0,sound:true,modal:null,bounces:new Map(),burn:null,shake:null,banner:null,lastGain:0};
+try{game.sound=localStorage.getItem('chip-stack-sort-sound')!=='off';}catch{}
+let audio=null,displayScore=0,last=performance.now(),clock=last,dpr=1,returnFocus=null,roundToken=0;
+const brandCache=[];
 const clamp=(x,a,b)=>Math.max(a,Math.min(b,x)),ease=t=>1-Math.pow(1-t,3),lerp=(a,b,t)=>a+(b-a)*t;
 const center=i=>({x:73+(i%5)*pitchX,y:216+Math.floor(i/5)*pitchY});
-const topY=(y,count)=>y-(count-1)*STEP;
+const topY=(y,count)=>y-depth(count)*BOARD_SCALE;
 function rr(c,x,y,w,h,r){c.beginPath();c.roundRect(x,y,w,h,r);}
 function circle(c,x,y,r){c.beginPath();c.arc(x,y,r,0,Math.PI*2);}
 function text(c,t,x,y,size,color,weight='600',align='center'){c.font=`${weight} ${size}px Arial, Helvetica, sans-serif`;c.textAlign=align;c.textBaseline='middle';c.fillStyle=color;c.fillText(t,x,y);}
 function loadBest(){try{return Math.max(0,Number(localStorage.getItem('chip-stack-sort-best'))||0);}catch{return 0;}}
 function saveBest(){try{localStorage.setItem('chip-stack-sort-best',String(game.best));}catch{/* Private/file browsing can disable storage; gameplay still works. */}}
 function announce(message){$('live').textContent=message;}
-function sound(kind,chain=0){
- if(!game.sound)return;
+function sound(kind,chain=0,count=2,index=-1){
+ if(!game.sound||document.hidden)return;
  try{
-  if(!audio)audio=new(window.AudioContext||window.webkitAudioContext)();
-  if(audio.state==='suspended')audio.resume().catch(()=>{});
-  const tones=kind==='clear'?[523.25,659.25,783.99,1046.5]:kind==='merge'?[330+chain*42,440+chain*42]:kind==='error'?[155]:kind==='pick'?[440]:[260,390];
-  tones.forEach((freq,i)=>{const o=audio.createOscillator(),g=audio.createGain(),at=audio.currentTime+i*.045;o.type=kind==='error'?'triangle':'sine';o.frequency.setValueAtTime(freq,at);o.frequency.exponentialRampToValueAtTime(freq*.85,at+.16);g.gain.setValueAtTime(.0001,at);g.gain.exponentialRampToValueAtTime(kind==='clear'?.085:.05,at+.01);g.gain.exponentialRampToValueAtTime(.0001,at+.21);o.connect(g);g.connect(audio.destination);o.start(at);o.stop(at+.23);o.onended=()=>{o.disconnect();g.disconnect();};});
- }catch{game.sound=false;updateSound();}
+  if(!audio)audio=new ChipAudio();
+  audio.setEnabled(true);
+  audio.play(kind,{chain,count,pan:index<0?0:((index%5)-2)*.2});
+ }catch{game.sound=false;audio?.setEnabled(false);updateSound();}
 }
 function updateSound(){const b=$('sound-btn');b.setAttribute('aria-pressed',String(game.sound));b.setAttribute('aria-label',game.sound?'Turn sound off':'Turn sound on');$('sound-waves').setAttribute('d',game.sound?'M16 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14':'m16 9 6 6m0-6-6 6');}
 function syncUI(){
@@ -155,19 +241,25 @@ function createBrandArt(id){
 }
 for(let i=0;i<6;i++)brandCache.push(createBrandArt(i));
 function drawChip(x,y,id,alpha=1,scale=1,rotation=0){ctx.save();ctx.globalAlpha*=alpha;ctx.translate(x,y);ctx.scale(scale,scale);ctx.rotate(rotation);ctx.drawImage(brandCache[id],-36,-36,72,72);ctx.restore();}
-function drawStack(stack,x,y,{alpha=1,scale=1,badge=true,shadow=true}={}){
+function drawStack(stack,x,y,{alpha=1,scale=1,badge=true,shadow=true,squash=0,heat=0}={}){
  if(!stack||!stack.length)return;
- ctx.save();ctx.translate(x,y);ctx.scale(scale,scale);ctx.globalAlpha=alpha;
- if(shadow){ctx.save();ctx.filter='blur(4px)';ctx.fillStyle='#00000070';ctx.beginPath();ctx.ellipse(1,9,27,20,0,0,Math.PI*2);ctx.fill();ctx.restore();}
- for(let j=0;j<stack.length;j++){
-  const cy=-j*STEP;
-  if(j<stack.length-1){circle(ctx,0,cy,R);ctx.fillStyle=CHIP_TYPES[stack[j]].dark;ctx.fill();circle(ctx,0,cy-.7,R-1);ctx.fillStyle=CHIP_TYPES[stack[j]].base;ctx.fill();ctx.strokeStyle=CHIP_TYPES[stack[j]].light;ctx.lineWidth=.8;ctx.stroke();}
-  else drawChip(0,cy,stack[j]);
+ const n=stack.length,h=depth(n),layers=Math.min(n,7),run=ChipRules.run(stack),ready=run>=10;
+ ctx.save();ctx.translate(x,y);ctx.scale(scale*(1+squash),scale*(1-squash*.75));ctx.globalAlpha*=alpha;
+ if(shadow){ctx.save();ctx.filter='blur(3px)';ctx.fillStyle='#00000070';ctx.beginPath();ctx.ellipse(1,10,26,17,0,0,Math.PI*2);ctx.fill();ctx.restore();}
+ // At most seven sampled rims and eight pixels of depth, even at 1000+.
+ for(let j=0;j<layers;j++){
+  const fraction=layers===1?0:j/(layers-1),cy=-fraction*h,id=stack[Math.round(fraction*(n-1))];
+  if(j<layers-1){circle(ctx,0,cy,R);ctx.fillStyle=CHIP_TYPES[id].dark;ctx.fill();circle(ctx,0,cy-.7,R-1);ctx.fillStyle=CHIP_TYPES[id].base;ctx.fill();ctx.strokeStyle=CHIP_TYPES[id].light;ctx.lineWidth=.8;ctx.stroke();}
+  else drawChip(0,cy,id);
  }
+ if(run>=7||heat){circle(ctx,0,-h,R+2);ctx.lineWidth=1.5;ctx.strokeStyle=ready?'#ffdc87':'#fbc66c70';ctx.stroke();if(heat){circle(ctx,0,-h,R);ctx.fillStyle=`rgba(255,230,165,${heat*.6})`;ctx.fill();}}
  if(badge){
-  const same=ChipRules.run(stack),mixed=same!==stack.length;
-  rr(ctx,14,-(stack.length-1)*STEP+13,22,16,7);ctx.fillStyle='#181818';ctx.fill();ctx.lineWidth=1;ctx.strokeStyle=mixed?'#d7ac6d':'#817063';ctx.stroke();text(ctx,String(stack.length),25,-(stack.length-1)*STEP+21,9.5,'#f7eee2','700');
-  if(mixed){circle(ctx,-20,-(stack.length-1)*STEP+18,5);ctx.fillStyle=CHIP_TYPES[stack[0]].base;ctx.fill();ctx.strokeStyle='#f8efde';ctx.lineWidth=1;ctx.stroke();}
+  const label=n.toLocaleString(),width=Math.max(23,label.length*6.6+10),right=34,bottom=20-h,mixed=run!==n;
+  rr(ctx,right-width,bottom-8,width,17,7);ctx.fillStyle=ready?'#ffd08a':'#161616';ctx.fill();ctx.lineWidth=1.2;ctx.strokeStyle=ready?'#fff0c5':mixed?'#ceac73':'#827063';ctx.stroke();
+  text(ctx,label,right-width/2,bottom+.5,10,ready?'#442609':'#fff1df','800');
+  if(mixed){circle(ctx,-20,17-h,5);ctx.fillStyle=CHIP_TYPES[stack[0]].base;ctx.fill();ctx.strokeStyle='#f8efde';ctx.lineWidth=1;ctx.stroke();}
+  // The progress ring describes the matching top run, not total height.
+  ctx.beginPath();ctx.arc(0,-h,R+2,-Math.PI/2,-Math.PI/2+Math.PI*2*Math.min(run/10,1));ctx.lineWidth=1.4;ctx.strokeStyle=ready?'#fff0b2':'#ffffff35';ctx.stroke();
  }
  ctx.restore();
 }
@@ -193,11 +285,14 @@ function drawBoard(){
    ctx.globalAlpha=pulse;ctx.strokeStyle=targeting?'#e7bb78':'#9b8670';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(p.x-3,p.y);ctx.lineTo(p.x+3,p.y);ctx.moveTo(p.x,p.y-3);ctx.lineTo(p.x,p.y+3);ctx.stroke();ctx.globalAlpha=1;
   }
   if(focus){rr(ctx,p.x-35.5,p.y-28.5,71,57,13);ctx.strokeStyle='#fbd199';ctx.lineWidth=2;ctx.setLineDash([4,3]);ctx.stroke();ctx.setLineDash([]);}
-  if(highlight&&!occupied){ctx.fillStyle='#f9bc6812';ctx.fill();if(!game.drag?.moving&&game.tray[game.selected])drawStack(game.tray[game.selected],p.x,p.y,{alpha:.28,badge:false,shadow:false});}
+  if(highlight&&!occupied){ctx.fillStyle='#f9bc6812';ctx.fill();if(!game.drag?.moving&&game.tray[game.selected])drawStack(game.tray[game.selected],p.x,p.y,{alpha:.28,badge:false,shadow:false,scale:BOARD_SCALE});}
   let stack=game.board[i];
   if(game.flight?.type==='merge'&&game.flight.to===i)stack=game.flight.beforeTarget;
   if(game.flight?.type==='place'&&game.flight.to===i)stack=[];
-  drawStack(stack,p.x,p.y);
+  const bounce=game.bounces.get(i),age=bounce?(clock-bounce.at)/420:1;
+  const squash=!reduced&&age<1?Math.sin(age*Math.PI*3)*Math.exp(-age*3)*bounce.strength:0;
+  if(age>=1)game.bounces.delete(i);
+  drawStack(stack,p.x,p.y,{scale:BOARD_SCALE,squash});
   if(game.invalid?.index===i){const t=(clock-game.invalid.at)/450;if(t<1){rr(ctx,p.x-34,p.y-27,68,54,12);ctx.strokeStyle=`rgba(255,110,91,${1-t})`;ctx.lineWidth=2;ctx.stroke();}else game.invalid=null;}
  }
 }
@@ -216,60 +311,103 @@ function drawTray(){
 function drawEffects(){
  const f=game.flight;
  if(f){
-  const progress=clamp((clock-f.start)/f.duration,0,1),from=f.fromPoint,to=f.toPoint;
-  for(let j=0;j<f.chips.length;j++){
-   const stagger=reduced?0:j*.04,t=clamp((progress-stagger)/(1-stagger),0,1),e=ease(t),lift=reduced?0:Math.sin(t*Math.PI)*35;
-   const x=lerp(from.x,to.x,e),y=lerp(from.y-j*STEP,to.y-j*STEP,e)-lift;
-   drawChip(x,y,f.chips[j],1,1+Math.sin(t*Math.PI)*.1,Math.sin(t*Math.PI)*.08);
+  const progress=clamp((clock-f.start)/f.duration,0,1),samples=Math.min(f.chips.length,9);
+  for(let j=0;j<samples;j++){
+   const fraction=samples===1?0:j/(samples-1),index=Math.round(fraction*(f.chips.length-1));
+   const stagger=reduced?0:fraction*.22,t=clamp((progress-stagger)/(1-stagger),0,1),e=ease(t),lift=reduced?0:Math.sin(t*Math.PI)*30;
+   const sy=f.fromPoint.y-depth(f.sourceCount)*(f.sourceCount-f.chips.length+index)/Math.max(1,f.sourceCount-1)*f.sourceScale;
+   const ty=f.toPoint.y-depth(f.targetCount)*(f.beforeTarget.length+index)/Math.max(1,f.targetCount-1)*BOARD_SCALE;
+   const x=lerp(f.fromPoint.x,f.toPoint.x,e),y=lerp(sy,ty,e)-lift;
+   if(!reduced&&t>.05&&t<.95){ctx.save();ctx.globalAlpha=Math.sin(t*Math.PI)*.2;ctx.strokeStyle=CHIP_TYPES[f.chips[index]].light;ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(x-(f.toPoint.x-f.fromPoint.x)*.09,y-(ty-sy)*.09+4);ctx.lineTo(x,y);ctx.stroke();ctx.restore();}
+   drawChip(x,y,f.chips[index],1,lerp(f.sourceScale,BOARD_SCALE,e)+(reduced?0:Math.sin(t*Math.PI)*.07),reduced?0:Math.sin(t*Math.PI)*.09);
   }
+  if(f.chips.length>9){text(ctx,`+${f.chips.length}`,lerp(f.fromPoint.x,f.toPoint.x,ease(progress)),lerp(f.fromPoint.y,f.toPoint.y,ease(progress))-42,12,'#ffe3ac','800');}
  }
- game.pulses=game.pulses.filter(p=>clock-p.at<p.life);for(const p of game.pulses){const t=(clock-p.at)/p.life;circle(ctx,p.x,p.y,p.radius+t*25);ctx.strokeStyle=p.color;ctx.globalAlpha=(1-t)*.65;ctx.lineWidth=2-t;ctx.stroke();ctx.globalAlpha=1;}
- game.particles=game.particles.filter(p=>clock-p.at<p.life);for(const p of game.particles){const age=(clock-p.at)/1000,t=(clock-p.at)/p.life;ctx.save();ctx.globalAlpha=1-t;ctx.translate(p.x+p.vx*age,p.y+p.vy*age+190*age*age);ctx.rotate(p.rotation+age*4);ctx.fillStyle=p.color;rr(ctx,-p.size/2,-p.size/2,p.size,p.size*.55,1);ctx.fill();ctx.restore();}
- game.floats=game.floats.filter(f=>clock-f.at<f.life);for(const p of game.floats){const t=(clock-p.at)/p.life;ctx.save();ctx.globalAlpha=Math.min(t*7,1)*Math.min((1-t)*4,1);const y=p.y-(reduced?0:ease(t)*37);ctx.shadowColor='#19120d';ctx.shadowBlur=8;text(ctx,p.label,p.x,y,p.size,p.color,'800');ctx.restore();}
+ if(game.burn){
+  const b=game.burn,p=center(b.index),t=clamp((clock-b.at)/b.life,0,1);
+  const glow=ctx.createRadialGradient(p.x,p.y-5,3,p.x,p.y-5,65);glow.addColorStop(0,`rgba(255,179,69,${t*.45})`);glow.addColorStop(1,'#ffb34500');ctx.fillStyle=glow;ctx.fillRect(p.x-65,p.y-70,130,130);
+  drawStack(b.chips,p.x,p.y,{scale:BOARD_SCALE*(reduced?1:1+t*.16),squash:reduced?0:Math.sin(t*Math.PI)*.17,heat:t,shadow:false});
+ }
+ game.pulses=game.pulses.filter(p=>clock-p.at<p.life);
+ for(const p of game.pulses){const t=clamp((clock-p.at)/p.life,0,1);circle(ctx,p.x,p.y,p.radius+ease(t)*(p.spread||25));ctx.strokeStyle=p.color;ctx.globalAlpha=(1-t)*.7;ctx.lineWidth=(p.width||2)*(1-t)+.4;ctx.stroke();ctx.globalAlpha=1;}
+ game.particles=game.particles.filter(p=>clock-p.at<p.life);
+ for(const p of game.particles){const age=Math.max(0,(clock-p.at)/1000),t=clamp((clock-p.at)/p.life,0,1);ctx.save();ctx.globalAlpha=(1-t)*(1-t);ctx.translate(p.x+p.vx*age,p.y+p.vy*age+180*age*age);ctx.rotate(p.rotation+age*p.spin);ctx.fillStyle=p.color;
+  if(p.kind==='spark'){ctx.fillRect(-p.size/2,-1,p.size*(1-t)+1,2);}else if(p.kind==='coin'){circle(ctx,0,0,p.size*.55);ctx.fill();ctx.strokeStyle='#ffffff80';ctx.lineWidth=.6;ctx.stroke();}else{rr(ctx,-p.size/2,-p.size/2,p.size,p.size*.55,1);ctx.fill();}ctx.restore();}
+ game.floats=game.floats.filter(f=>clock-f.at<f.life);
+ for(const p of game.floats){const t=clamp((clock-p.at)/p.life,0,1);ctx.save();ctx.globalAlpha=Math.min(t*12,1)*Math.min((1-t)*4,1);const y=p.y-(reduced?0:ease(t)*30);ctx.translate(p.x,y);if(!reduced){const s=1+Math.sin(Math.min(t*5,1)*Math.PI)*.2;ctx.scale(s,s);}ctx.shadowColor='#19120d';ctx.shadowBlur=9;ctx.lineWidth=4;ctx.strokeStyle='#23170e';ctx.font=`800 ${p.size}px Arial`;ctx.textAlign='center';ctx.textBaseline='middle';ctx.strokeText(p.label,0,0);text(ctx,p.label,0,0,p.size,p.color,'800');if(p.detail)text(ctx,p.detail,0,22,9,'#fff0d2','700');ctx.restore();}
+ if(game.banner){const b=game.banner,t=(clock-b.at)/b.life;if(t>=1)game.banner=null;else{ctx.save();ctx.globalAlpha=Math.min(t*12,1,(1-t)*5);const width=Math.min(370,b.label.length*6.6+34);rr(ctx,225-width/2,592,width,24,12);ctx.fillStyle='#533c23';ctx.fill();ctx.strokeStyle='#b48a4e';ctx.lineWidth=1;ctx.stroke();text(ctx,b.label,225,604,10.5,'#ffe0a6','800');ctx.restore();}}
 }
 function frame(now){
  clock=now;const dt=Math.min((now-last)/1000,.05);last=now;
  if(Math.abs(displayScore-game.score)>.5)displayScore=lerp(displayScore,game.score,1-Math.exp(-dt*11));else displayScore=game.score;
  const displayed=Math.round(displayScore).toLocaleString();if($('score').textContent!==displayed)$('score').textContent=displayed;
- ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);drawBackground();drawBoard();drawTray();drawEffects();
+ ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);drawBackground();ctx.save();
+ if(game.shake&&!reduced){const s=game.shake,t=clamp((now-s.at)/s.life,0,1),power=s.power*(1-t)*(1-t);ctx.translate(Math.sin(t*53)*power,Math.cos(t*67)*power*.55);if(t>=1)game.shake=null;}
+ drawBoard();drawTray();drawEffects();ctx.restore();
  requestAnimationFrame(frame);
 }
 function resize(){const rect=canvas.getBoundingClientRect();dpr=Math.min(window.devicePixelRatio||1,3)*rect.width/W;canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr);}
 function wait(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
-async function fly(event){
+function impact(power){if(!reduced)game.shake={at:performance.now(),life:230+power*18,power:Math.min(6,power)};}
+async function fly(event,token=roundToken){
  const a=event.type==='place'?{x:trayCenters[event.trayIndex],y:trayY}:center(event.from),b=center(event.to);
  const sourceCount=event.type==='place'?event.chips.length:event.beforeSource.length;
- game.flight={...event,fromPoint:{x:a.x,y:a.y-(sourceCount-event.chips.length)*STEP},toPoint:{x:b.x,y:b.y-event.beforeTarget.length*STEP},start:performance.now(),duration:reduced?35:260+event.chips.length*22};
- await wait(game.flight.duration);game.flight=null;
- game.pulses.push({x:b.x,y:topY(b.y,game.board[event.to].length),at:performance.now(),life:300,radius:25,color:CHIP_TYPES[event.chips[0]].light});
+ const flight={...event,fromPoint:a,toPoint:b,sourceCount,targetCount:event.beforeTarget.length+event.chips.length,sourceScale:event.type==='place'?1:BOARD_SCALE,start:performance.now(),duration:reduced?30:Math.min(410,240+Math.log2(event.chips.length+1)*32)};
+ game.flight=flight;await wait(flight.duration);if(token!==roundToken)return;
+ game.flight=null;
+ game.bounces.set(event.to,{at:performance.now(),strength:Math.min(.22,.1+event.chips.length*.006)});
+ sound(event.type==='place'?'place':'land',game.transfers*.35+game.combo,event.chips.length,event.to);
+ if(event.type==='merge'&&flight.targetCount>=8)impact(1.3+Math.min(2,flight.targetCount/14));
+ game.pulses.push({x:b.x,y:topY(b.y,game.board[event.to].length),at:performance.now(),life:260,radius:23,color:CHIP_TYPES[event.chips[0]].light});
 }
-function burst(index,brand){
- const p=center(index),at=performance.now();
- game.pulses.push({x:p.x,y:p.y-12,at,life:500,radius:18,color:CHIP_TYPES[brand].light});
- if(!reduced)for(let i=0;i<28;i++){const a=Math.random()*Math.PI*2,v=35+Math.random()*160;game.particles.push({x:p.x,y:p.y-12,vx:Math.cos(a)*v,vy:Math.sin(a)*v-65,size:3+Math.random()*5,color:i%3===0?'#faddab':CHIP_TYPES[brand].light,at,life:500+Math.random()*450,rotation:Math.random()*6});}
- game.floats.push({x:p.x,y:p.y-20,label:'+100',size:23,color:'#ffda94',at,life:1100});
+function burst(event){
+ const {index,brand,count,points}=event,p=center(index),at=performance.now(),size=Math.min(2.3,1+Math.log2(count/10)*.42);
+ game.pulses.push({x:p.x,y:p.y-6,at,life:520,radius:16,spread:38*size,width:4,color:'#ffdfa0'});
+ if(!reduced){
+  game.pulses.push({x:p.x,y:p.y-6,at,life:700,radius:24,spread:49*size,width:2,color:CHIP_TYPES[brand].light});
+  const pieces=Math.min(110,Math.round(35+count*1.7+game.combo*5));
+  for(let i=0;i<pieces;i++){const a=Math.random()*Math.PI*2,v=(55+Math.random()*145)*size;game.particles.push({x:p.x,y:p.y-6,vx:Math.cos(a)*v,vy:Math.sin(a)*v-65,size:3+Math.random()*6,color:i%4===0?'#fff0b9':CHIP_TYPES[brand].light,at,life:550+Math.random()*550,rotation:Math.random()*6,spin:(Math.random()-.5)*12,kind:i%5===0?'coin':i%3===0?'spark':'confetti'});}
+  if(game.particles.length>300)game.particles.splice(0,game.particles.length-300);
+ }
+ const title=count>=20?'MEGA CLEAR!':count>=14?'SUPER CLEAR!':'SWEET CLEAR!';
+ game.floats.push({x:clamp(p.x,80,370),y:Math.max(238,p.y-8),label:`+${points.toLocaleString()}!`,detail:`${count} CHIPS · ${title}`,size:Math.min(36,25+count*.25),color:'#ffdfa0',at,life:1350});
+ game.banner={label:game.combo>1?`COMBO x${game.combo}! · ${title}`:`${title} · ${count} CHIPS`,at,life:1700};
+ impact(2+Math.min(4,(count-10)*.16+game.combo*.5));
 }
 function reject(index){game.invalid={index,at:performance.now()};sound('error');announce('That slot is occupied. Choose an empty slot.');}
 async function place(index){
  if(game.busy||game.over||game.modal||game.selected<0)return false;
- if(index<0||index>=30||game.board[index].length){reject(index);return false;}
+ if(!Number.isInteger(index)||index<0||index>=30||game.board[index].length){reject(index);return false;}
  const ti=game.selected,stack=game.tray[ti]?.slice();if(!stack)return false;
  if(!ChipRules.place(game.board,game.tray,index,ti))return false;
- game.selected=-1;game.busy=true;game.hover=-1;game.combo=0;game.moves++;syncUI();sound('place');
- await fly({type:'place',trayIndex:ti,to:index,chips:stack,beforeTarget:[]});
+ const token=roundToken,scoreBefore=game.score;
+ game.selected=-1;game.busy=true;game.hover=-1;game.combo=0;game.transfers=0;game.moves++;syncUI();
+ await fly({type:'place',trayIndex:ti,to:index,chips:stack,beforeTarget:[]},token);if(token!==roundToken)return false;
  for(const event of ChipRules.resolve(game.board,index)){
-  if(event.type==='merge'){sound('merge',game.combo);await fly(event);}
-  else{game.combo++;game.score+=100;game.best=Math.max(game.best,game.score);saveBest();burst(event.index,event.brand);sound('clear',game.combo);$('score-card').classList.remove('bump');void $('score-card').offsetWidth;$('score-card').classList.add('bump');syncUI();await wait(reduced?30:230);}
+  if(event.type==='merge'){
+   game.transfers++;sound('merge',game.combo+game.transfers*.45,event.chips.length,event.to);await fly(event,token);if(token!==roundToken)return false;
+  }else{
+   game.combo++;
+   game.burn={...event,at:performance.now(),life:reduced?30:180};
+   sound('charge',game.combo-1,event.count,event.index);
+   await wait(game.burn.life);if(token!==roundToken)return false;game.burn=null;
+   game.score+=event.points;game.best=Math.max(game.best,game.score);saveBest();
+   burst(event);sound('clear',game.combo-1,event.count,event.index);
+   $('score-card').classList.remove('bump');void $('score-card').offsetWidth;$('score-card').classList.add('bump');syncUI();
+   await wait(reduced?30:200);if(token!==roundToken)return false;
+  }
  }
- if(game.combo>1)game.floats.push({x:225,y:590,label:`${game.combo} CLEARS · NICE CHAIN!`,size:12,color:'#ffd492',at:performance.now(),life:1400});
- if(game.tray.every(s=>!s)){game.tray=ChipRules.makeTray();game.round++;}
+ game.lastGain=game.score-scoreBefore;
+ if(game.combo>1)game.banner={label:`COMBO x${game.combo}! · +${game.lastGain.toLocaleString()} TOTAL`,at:performance.now(),life:2000};
+ if(game.tray.every(s=>!s)){game.tray=ChipRules.makeTray();game.round++;sound('refresh');}
  game.busy=false;game.over=ChipRules.over(game.board);syncUI();
  announce(`${game.combo?`${game.combo} stack${game.combo===1?'':'s'} cleared. `:''}Score ${game.score}. ${ChipRules.empty(game.board)} empty slots. ${game.tray.filter(Boolean).length} tray stacks available.`);
- if(game.over){await wait(reduced?0:300);openModal('over');}
+ if(game.over){await wait(reduced?0:300);if(token===roundToken&&game.over)openModal('over');}
  return true;
 }
 function select(index){if(game.busy||game.over||game.modal||!game.tray[index])return;game.selected=index;sound('pick');syncUI();const s=game.tray[index];announce(`Stack ${index+1}: ${s.length} chips. ${CHIP_TYPES[s[s.length-1]].name} on top${ChipRules.run(s)!==s.length?', with another brand underneath':''}. Select an empty grid slot.`);}
 function newGame(){
+ roundToken++;game.bounces.clear();game.burn=null;game.shake=null;game.banner=null;game.lastGain=0;game.transfers=0;
  game.board=Array.from({length:30},()=>[]);game.tray=ChipRules.makeTray();game.score=0;displayScore=0;game.best=loadBest();game.selected=-1;game.busy=false;game.over=false;game.moves=0;game.round=1;game.drag=null;game.hover=-1;game.flight=null;game.particles=[];game.floats=[];game.pulses=[];game.invalid=null;game.cursor=-1;game.combo=0;game.keyboard=false;closeModal();syncUI();announce('New game. Thirty empty slots. Select one of your three tray stacks.');
 }
 function point(e){const b=canvas.getBoundingClientRect();return{x:(e.clientX-b.left)*W/b.width,y:(e.clientY-b.top)*H/b.height};}
@@ -304,20 +442,21 @@ document.addEventListener('keydown',e=>{
  else if(e.key==='Escape'){game.selected=-1;cancelDrag();syncUI();}
  else if(e.key.toLowerCase()==='h')openModal('help');else if(e.key.toLowerCase()==='m')toggleSound();else if(e.key.toLowerCase()==='r')openModal('restart');
 });
-function closeModal(){const wasOpen=game.modal;game.modal=null;$('overlay').hidden=true;canvas.removeAttribute('aria-hidden');if(wasOpen)(returnFocus||canvas).focus({preventScroll:true});}
+function closeModal(){const wasOpen=game.modal;game.modal=null;$('overlay').hidden=true;canvas.removeAttribute('aria-hidden');document.querySelector('.header').inert=false;document.querySelector('.footer').inert=false;canvas.inert=false;if(wasOpen)(returnFocus?.isConnected?returnFocus:canvas).focus({preventScroll:true});}
 function openModal(type){
- if(game.busy)return;cancelDrag();returnFocus=document.activeElement;game.modal=type;$('overlay').hidden=false;canvas.setAttribute('aria-hidden','true');
- if(type==='help')$('modal').innerHTML='<div class="modal-eyebrow">SMALL STACKS. BIG SATISFACTION.</div><h2 id="modal-title">Find your kind.</h2><ol class="steps"><li><strong>Pick & place.</strong> Drag a tray stack, or tap it and then tap any empty grid slot.</li><li><strong>Make a match.</strong> Matching top chips in the four neighboring slots fly into your stack. Stacks hold at most 10 chips total.</li><li><strong>Let it chain.</strong> Uncover another brand and it checks its own neighbors. A tiny color dot marks a layered stack.</li><li><strong>Clear the way.</strong> 10 identical chips clear for +100 points. Play all 3 tray stacks to get a fresh set.</li></ol><p>Keep an empty slot available. A full board ends the game.<br><strong>Keyboard:</strong> 1–3 to pick · arrows to aim · Enter to place.</p><button class="primary" id="modal-primary">Got it. Let’s stack.</button>';
+ if(game.busy)return;cancelDrag();returnFocus=document.activeElement;game.modal=type;$('overlay').hidden=false;canvas.setAttribute('aria-hidden','true');document.querySelector('.header').inert=true;document.querySelector('.footer').inert=true;canvas.inert=true;
+ if(type==='help')$('modal').innerHTML='<div class="modal-eyebrow">SMALL STACKS. BIG SATISFACTION.</div><h2 id="modal-title">Find your kind.</h2><ol class="steps"><li><strong>Pick & place.</strong> Drag a tray stack, or tap it and then tap any empty grid slot.</li><li><strong>Make a match.</strong> All matching top chips from the four neighbors fly into your stack. No stack limit; every matching neighbor joins before ignition.</li><li><strong>Let it chain.</strong> Uncover another brand and it checks its own neighbors. A tiny color dot marks a layered stack.</li><li><strong>Clear the way.</strong> 10+ identical top chips burn the ENTIRE stack, including buried layers. Earn 10 points per chip burned: 14 = +140, 20 = +200. Play all 3 tray stacks to refill.</li></ol><p>Keep an empty slot available. A full board ends the game.<br><strong>Keyboard:</strong> 1–3 to pick · arrows to aim · Enter to place.</p><button class="primary" id="modal-primary">Got it. Let’s stack.</button>';
  else if(type==='restart')$('modal').innerHTML='<div class="modal-eyebrow">A CLEAN SLATE</div><h2 id="modal-title">Start fresh?</h2><p>Your current board and score will be reset.<br>Your personal best stays right here.</p><button class="primary" id="modal-primary">Yes, new game</button><button class="secondary" id="modal-secondary">Keep stacking</button>';
  else $('modal').innerHTML=`<div class="modal-eyebrow">GAME OVER · EVERY STACK COUNTS</div><h2 id="modal-title">All stacked up.</h2><p>No empty slots left. A fresh board is a fresh possibility.</p><div class="result"><div class="result-label">FINAL SCORE</div><div class="result-score">${game.score.toLocaleString()}</div><div class="result-best">PERSONAL BEST ${game.best.toLocaleString()} · ${game.moves} MOVES</div></div><button class="primary" id="modal-primary">Play again</button>`;
  $('modal-primary').addEventListener('click',()=>type==='help'?closeModal():newGame());$('modal-secondary')?.addEventListener('click',closeModal);$('modal-primary').focus({preventScroll:true});
 }
-function toggleSound(){game.sound=!game.sound;updateSound();if(game.sound)sound('pick');}
+function toggleSound(){game.sound=!game.sound;audio?.setEnabled(game.sound);try{localStorage.setItem('chip-stack-sort-sound',game.sound?'on':'off');}catch{}updateSound();if(game.sound)sound('pick');}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)audio?.setEnabled(false);else if(game.sound)audio?.setEnabled(true);});
 $('sound-btn').addEventListener('click',toggleSound);$('help-btn').addEventListener('click',()=>openModal('help'));$('restart-btn').addEventListener('click',()=>openModal('restart'));
 $('overlay').addEventListener('pointerdown',e=>{if(e.target===$('overlay')&&game.modal!=='over')closeModal();});
 window.addEventListener('resize',resize);if(window.ResizeObserver)new ResizeObserver(resize).observe(canvas);
 // A small opt-in diagnostic surface for local tests; absent during normal play.
-if(new URLSearchParams(location.search).has('test'))window.ChipStackDebug={game,place,select,newGame,syncUI,center,openModal,closeModal};
+if(new URLSearchParams(location.search).has('test'))window.ChipStackDebug={game,place,select,newGame,syncUI,center,openModal,closeModal,depth,drawStack,fly,burst,sound,toggleSound,audioState:()=>audio?{state:audio.ctx.state,voices:audio.voices.size,enabled:audio.enabled}:null};
 newGame();updateSound();resize();requestAnimationFrame(frame);
 })();
 </script>
